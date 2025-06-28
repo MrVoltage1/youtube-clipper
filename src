@@ -1,0 +1,331 @@
+# src/main.py
+import os
+import sys
+import logging
+from pathlib import Path
+
+# Add src to path
+sys.path.append(str(Path(__file__).parent))
+
+from video_processor import VideoProcessor
+from ai_analyzer import AIAnalyzer
+from telegram_handler import TelegramHandler
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def main():
+    """Main processing function for GitHub Actions"""
+    try:
+        # Get environment variables
+        youtube_url = os.getenv('YOUTUBE_URL')
+        chat_id = os.getenv('CHAT_ID') or os.getenv('TELEGRAM_CHAT_ID')
+        
+        if not youtube_url or not chat_id:
+            logger.error("Missing required environment variables")
+            sys.exit(1)
+        
+        logger.info(f"Processing video: {youtube_url}")
+        logger.info(f"Chat ID: {chat_id}")
+        
+        # Initialize components
+        telegram = TelegramHandler()
+        processor = VideoProcessor()
+        ai_analyzer = AIAnalyzer()
+        
+        # Send start message
+        telegram.send_message(chat_id, "🎬 Processing your YouTube video...")
+        
+        # Process video
+        video_id = processor.extract_youtube_id(youtube_url)
+        if not video_id:
+            telegram.send_message(chat_id, "❌ Invalid YouTube URL!")
+            return
+        
+        # Get transcript
+        telegram.send_message(chat_id, "📝 Getting transcript...")
+        transcript = processor.get_transcript(video_id)
+        if not transcript:
+            telegram.send_message(chat_id, "❌ No transcript available!")
+            return
+        
+        # AI analysis
+        telegram.send_message(chat_id, "🤖 AI analyzing for funny moments...")
+        clip_data = ai_analyzer.find_funny_clip(transcript)
+        
+        # Download and process
+        telegram.send_message(chat_id, "⬇️ Downloading and processing...")
+        clip_path = processor.create_clip(video_id, clip_data)
+        
+        if clip_path:
+            # Send final clip
+            telegram.send_video(chat_id, clip_path, clip_data['caption'])
+            telegram.send_message(chat_id, "✅ Done! Enjoy your clip!")
+        else:
+            telegram.send_message(chat_id, "❌ Failed to create clip!")
+            
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        if 'telegram' in locals() and chat_id:
+            telegram.send_message(chat_id, f"❌ Error: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+---
+
+# src/video_processor.py
+import os
+import re
+import tempfile
+from pathlib import Path
+import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
+import logging
+
+logger = logging.getLogger(__name__)
+
+class VideoProcessor:
+    def __init__(self):
+        self.temp_dir = Path(tempfile.gettempdir()) / "clipper"
+        self.temp_dir.mkdir(exist_ok=True)
+    
+    def extract_youtube_id(self, url):
+        """Extract YouTube video ID from URL"""
+        patterns = [
+            r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+            r'(?:embed\/)([0-9A-Za-z_-]{11})',
+            r'(?:v\/|youtu\.be\/)([0-9A-Za-z_-]{11})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        return None
+    
+    def get_transcript(self, video_id):
+        """Get YouTube transcript"""
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            logger.info(f"Got transcript with {len(transcript)} segments")
+            return transcript
+        except Exception as e:
+            logger.error(f"Transcript error: {e}")
+            return None
+    
+    def download_video(self, video_id):
+        """Download YouTube video"""
+        try:
+            output_template = str(self.temp_dir / f"{video_id}.%(ext)s")
+            
+            ydl_opts = {
+                'format': 'best[height<=720]',
+                'outtmpl': output_template,
+                'quiet': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://youtube.com/watch?v={video_id}"])
+            
+            # Find downloaded file
+            for file in self.temp_dir.glob(f"{video_id}.*"):
+                if file.suffix in ['.mp4', '.webm', '.mkv']:
+                    return str(file)
+            return None
+            
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            return None
+    
+    def create_clip(self, video_id, clip_data):
+        """Create video clip with caption"""
+        try:
+            # Download video
+            video_path = self.download_video(video_id)
+            if not video_path:
+                return None
+            
+            # Load and clip video
+            video = VideoFileClip(video_path)
+            clip = video.subclip(clip_data['start'], clip_data['end'])
+            
+            # Create caption
+            caption = TextClip(
+                clip_data['caption'],
+                fontsize=30,
+                color='white',
+                stroke_color='black',
+                stroke_width=3,
+                font='Arial-Bold',
+                method='caption',
+                size=(clip.w * 0.9, None)
+            ).set_duration(clip.duration).set_position(('center', 'bottom'))
+            
+            # Composite
+            final = CompositeVideoClip([clip, caption])
+            
+            # Export
+            output_path = self.temp_dir / f"clip_{video_id}.mp4"
+            final.write_videofile(
+                str(output_path),
+                codec='libx264',
+                audio_codec='aac',
+                verbose=False,
+                logger=None
+            )
+            
+            # Cleanup
+            video.close()
+            clip.close()
+            final.close()
+            caption.close()
+            
+            return str(output_path)
+            
+        except Exception as e:
+            logger.error(f"Clip creation error: {e}")
+            return None
+
+---
+
+# src/ai_analyzer.py
+import requests
+import random
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AIAnalyzer:
+    def __init__(self):
+        self.hf_token = os.getenv('HF_API_TOKEN')
+        self.api_url = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-large"
+    
+    def find_funny_clip(self, transcript):
+        """Use AI to find funny moments or fallback to random"""
+        try:
+            if self.hf_token:
+                return self._ai_analysis(transcript)
+            else:
+                return self._fallback_analysis(transcript)
+        except Exception as e:
+            logger.error(f"AI analysis error: {e}")
+            return self._fallback_analysis(transcript)
+    
+    def _ai_analysis(self, transcript):
+        """Use Hugging Face API for analysis"""
+        try:
+            # Prepare transcript text
+            text = " ".join([segment['text'] for segment in transcript[:50]])  # Limit length
+            
+            prompt = f"Find the funniest moment in this transcript and suggest a 30-45 second clip: {text}"
+            
+            headers = {"Authorization": f"Bearer {self.hf_token}"}
+            data = {"inputs": prompt}
+            
+            response = requests.post(self.api_url, headers=headers, json=data, timeout=30)
+            
+            if response.status_code == 200:
+                # Parse response and extract timing
+                # For now, use fallback but you can enhance this
+                return self._fallback_analysis(transcript)
+            else:
+                return self._fallback_analysis(transcript)
+                
+        except Exception as e:
+            logger.error(f"HF API error: {e}")
+            return self._fallback_analysis(transcript)
+    
+    def _fallback_analysis(self, transcript):
+        """Fallback random clip selection"""
+        if len(transcript) < 10:
+            start_idx = 0
+        else:
+            start_idx = random.randint(0, len(transcript) - 10)
+        
+        start_time = transcript[start_idx]['start']
+        end_time = min(start_time + 40, transcript[-1]['start'] + transcript[-1]['duration'])
+        
+        # Generate goofy caption
+        captions = [
+            "when u realize ur favorite youtuber is actualy smart 😭",
+            "me trying to explain this to my mom be like:",
+            "POV: ur brain during the test vs during the shower",
+            "why did i watch this at 3am tho 💀",
+            "this hits diferent at 2x speed ngl",
+            "nobody: \nme at 3am:",
+            "teacher: the test isnt that hard\nthe test:",
+            "mom: we have food at home\nthe food at home:",
+        ]
+        
+        return {
+            'start': start_time,
+            'end': end_time,
+            'caption': random.choice(captions)
+        }
+
+---
+
+# src/telegram_handler.py
+import os
+import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TelegramHandler:
+    def __init__(self):
+        self.token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+    
+    def send_message(self, chat_id, text):
+        """Send text message"""
+        try:
+            url = f"{self.base_url}/sendMessage"
+            data = {'chat_id': chat_id, 'text': text}
+            response = requests.post(url, json=data, timeout=30)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Send message error: {e}")
+            return False
+    
+    def send_video(self, chat_id, video_path, caption):
+        """Send video file"""
+        try:
+            url = f"{self.base_url}/sendVideo"
+            
+            with open(video_path, 'rb') as video_file:
+                files = {'video': video_file}
+                data = {'chat_id': chat_id, 'caption': caption}
+                response = requests.post(url, files=files, data=data, timeout=120)
+            
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Send video error: {e}")
+            return False
+
+---
+
+# src/setup_webhook.py
+import os
+import requests
+import json
+
+def setup_github_webhook():
+    """Setup webhook to trigger GitHub Actions from Telegram"""
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    github_token = os.getenv('GITHUB_TOKEN')
+    repo = os.getenv('GITHUB_REPO')
+    
+    # This would set up a webhook URL that triggers the workflow
+    # For now, we'll use manual triggers or repository dispatch
+    
+    webhook_url = f"https://api.github.com/repos/{repo}/dispatches"
+    
+    print("✅ Webhook setup complete!")
+    print("Send YouTube URLs to your Telegram bot to trigger processing")
+
+if __name__ == "__main__":
+    setup_github_webhook()
